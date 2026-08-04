@@ -56,24 +56,36 @@ func newQueryFrontend() *QueryFrontend {
 }
 
 // handleQuery simulates a PromQL query. It captures the shard epoch at start,
-// then verifies the epoch hasn't changed before writing the result to the
-// cache — if a rebalance happened mid-query, the cache write is discarded so
-// stale fragments never land under the new topology's keys.
+// then atomically verifies the epoch hasn't changed and writes the result to
+// the cache. The check-and-write happen under the same lock, so a rebalance
+// that lands between the check and the write cannot slip a stale fragment in.
+// If a rebalance happened mid-query, the cache write is discarded and "" is
+// returned, signalling the caller to retry.
 func (f *QueryFrontend) handleQuery(tenantID string, reqHash uint64, result string) string {
 	startEpoch := f.tracker.CurrentEpoch()
 	key := cacheKey(f.tracker, tenantID, reqHash)
 
-	// Simulate query execution. If a rebalance occurred mid-flight (epoch
-	// changed), discard the write — the caller should retry rather than cache
-	// a result built from a stale shard assignment.
-	if f.tracker.CurrentEpoch() != startEpoch {
-		return "" // signal: not cached, retry required
-	}
-
 	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	// Simulate query execution finishing, then re-verify the epoch under the
+	// lock before committing the cache write.
+	if f.tracker.CurrentEpoch() != startEpoch {
+		return "" // not cached; caller should retry
+	}
 	f.cache[key] = result
-	f.mu.Unlock()
 	return key
+}
+
+// cachedResult reads a query result from the cache for the current epoch.
+// Keys rotate with the epoch, so a read here can never return a fragment
+// produced under a different shard assignment.
+func (f *QueryFrontend) cachedResult(tenantID string, reqHash uint64) (string, bool) {
+	key := cacheKey(f.tracker, tenantID, reqHash)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.cache[key]
+	return v, ok
 }
 
 func main() {
@@ -96,5 +108,11 @@ func main() {
 		panic("cache key collision: same key across different shard epochs")
 	}
 
-	fmt.Println("Simulation passed: cache keys diverge across shard epochs.")
+	// Read path: the old epoch's fragment must NOT be readable under the new
+	// epoch (keys rotated), and the new fragment must be.
+	if v, ok := f.cachedResult("tenant-a", 12345); !ok || v != "result-v2" {
+		panic(fmt.Sprintf("expected result-v2 under current epoch, got %q ok=%v", v, ok))
+	}
+
+	fmt.Println("Simulation passed: cache keys diverge across shard epochs, reads are epoch-consistent.")
 }
